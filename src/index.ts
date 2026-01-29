@@ -2,11 +2,17 @@ import axios from "axios"
 import ping from "ping"
 import arp from "node-arp"
 import wol from "node-wol"
+import { spawn } from "node:child_process"
 import type { AddressModel } from "./models/address.model"
 import { configDotenv } from "dotenv"
+import type { CommandModel } from "./models/command.model"
 
 // Read the node configuration
 configDotenv()
+const DEVICE_CHECK_INTERVAL = Number(process.env.DEVICE_CHECK_INTERVAL)
+const COMMAND_CHECK_INTERVAL = Number(process.env.COMMAND_CHECK_INTERVAL)
+const TERMINAL_MAX_LINES = Number(process.env.TERMINAL_MAX_LINES)
+const COMMAND_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS)
 
 // Creating a base connection object with the REST API
 const client = axios.create({
@@ -95,4 +101,112 @@ async function run() {
 // Run monitoring once since interval by default doesnt have an initial run when set
 // After that monitoring will be run on time specified in node configuration file
 run()
-setInterval(run, Number(process.env.RUN_INTERVAL))
+setInterval(run, DEVICE_CHECK_INTERVAL)
+
+// Remote Terminal Command Listener
+let stopped = false;
+let running = false;
+
+function getDefaultShell(): { shell: string; argsPrefix: string[] } {
+    if (process.platform === "win32") {
+        // cmd.exe is the default Windows shell
+        return {
+            shell: process.env.ComSpec ?? "cmd.exe",
+            argsPrefix: ["/d", "/s", "/c"],
+        };
+    }
+    // use user's shell if available, fallback to sh
+    return {
+        shell: process.env.SHELL ?? "/bin/sh",
+        argsPrefix: ["-lc"],
+    };
+}
+
+async function runInDefaultShell(command: string): Promise<string[]> {
+    const { shell, argsPrefix } = getDefaultShell();
+
+    return new Promise((resolve) => {
+        const lines: string[] = [];
+        let killed = false;
+
+        const child = spawn(shell, [...argsPrefix, command], {
+            windowsHide: true,
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        const addChunk = (buf: Buffer, prefix = "") => {
+            const text = buf.toString("utf8").replace(/\r\n/g, "\n");
+            for (const l of text.split("\n")) {
+                if (!l) continue;
+                lines.push(prefix + l);
+
+                if (lines.length >= TERMINAL_MAX_LINES && !killed) {
+                    killed = true;
+                    // stop the process after enough lines
+                    try {
+                        child.kill();
+                    } catch { }
+                    break;
+                }
+            }
+        };
+
+        child.stdout?.on("data", (d: Buffer) => addChunk(d));
+        child.stderr?.on("data", (d: Buffer) => addChunk(d));
+
+        const timer = setTimeout(() => {
+            if (!killed) {
+                killed = true;
+                try {
+                    child.kill();
+                } catch { }
+            }
+        }, COMMAND_TIMEOUT_MS);
+
+        child.on("error", (err) => {
+            clearTimeout(timer);
+            resolve([`spawn error: ${String((err as any)?.message ?? err)}`]);
+        });
+
+        child.on("close", () => {
+            clearTimeout(timer);
+            resolve(lines);
+        });
+    });
+}
+
+// Remote Terminal Command Listener
+setInterval(async () => {
+    if (stopped) return;
+    if (running) return;
+
+    running = true;
+    try {
+        const rsp = await client.get<CommandModel[]>("/node/retrieve-commands");
+        const commands = rsp.data ?? [];
+
+        for (const cmd of commands) {
+            const value = (cmd.value ?? "").trim();
+
+            // exact stop condition
+            if (value === "stop" || value === "exit") {
+                stopped = true;
+                break;
+            }
+
+            console.log(`Upstream Command ${cmd.commandId}: ${value}`);
+            await client.request({
+                url: '/node/command-reply',
+                method: 'POST',
+                data: {
+                    commandId: cmd.commandId,
+                    replies: await runInDefaultShell(value)
+                }
+            })
+        }
+    } catch (e) {
+        console.log("Failed:", e);
+    } finally {
+        running = false;
+    }
+}, COMMAND_CHECK_INTERVAL);
