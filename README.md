@@ -11,3 +11,10 @@ COMMAND_CHECK_INTERVAL=2000
 TERMINAL_MAX_LINES=12
 COMMAND_TIMEOUT_MS=8000
 ```
+
+On newer linux distrubutions `arp` library isnt available.
+In order to fix that you will have to install it:
+
+```bash
+sudo apt install net-tools
+```
